@@ -1,0 +1,308 @@
+(() => {
+'use strict'
+
+const CONFIG = window.TRADEFLOW_CONFIG || {}
+const SESSION_KEY = 'tradeflow_cloud_session_v1'
+const THEME_CACHE_KEY = 'tradeflow_cloud_theme_v1'
+const LEGACY_REVIEWS_KEY = 'tradeflow_simple_reviews_v1'
+const LEGACY_PREFS_KEY = 'tradeflow_simple_preferences_v1'
+const LEGACY_THEME_KEY = 'tradeflow_simple_theme_v1'
+const BACKUP_SCHEMA = 'tradeflow-supabase-backup'
+const SCHEMA_VERSION = 7
+
+const $ = (s, r = document) => r.querySelector(s)
+const $$ = (s, r = document) => [...r.querySelectorAll(s)]
+const now = new Date()
+const state = {
+  unlocked: false,
+  reviews: [],
+  settings: { officialStartDate: '2026-10-22', theme: 'dark' },
+  draft: { risk: null, strategy: null, setup: null, result: null },
+  page: 'dashboard',
+  range: '30',
+  calendarMonth: new Date(now.getFullYear(), now.getMonth(), 1),
+  filters: { result: 'all', discipline: 'all' },
+  pendingImport: null,
+  inactivityTimer: null,
+}
+
+function configReady() {
+  return /^https:\/\/.+\.supabase\.co$/i.test(CONFIG.SUPABASE_URL || '') &&
+    /^sb_(publishable|anon)_/i.test(CONFIG.SUPABASE_PUBLISHABLE_KEY || '')
+}
+function sessionToken() { return sessionStorage.getItem(SESSION_KEY) || '' }
+function setSession(token) { if (token) sessionStorage.setItem(SESSION_KEY, token); else sessionStorage.removeItem(SESSION_KEY) }
+function setSync(text, type = '') { const el = $('#syncStatus'); if (!el) return; el.textContent = text; el.className = `sync-pill ${type}` }
+function showLoading(text = 'Loading TradeFlow…') { $('#loadingText').textContent = text; $('#loadingOverlay').classList.add('show') }
+function hideLoading() { $('#loadingOverlay').classList.remove('show') }
+function localDateKey(d = new Date()) { const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0'); return `${y}-${m}-${day}` }
+function parseKey(k) { const [y,m,d]=String(k).split('-').map(Number); return new Date(y,m-1,d) }
+function addDays(d,n){const x=new Date(d);x.setDate(x.getDate()+n);return x}
+function validDateKey(k){if(!/^\d{4}-\d{2}-\d{2}$/.test(String(k)))return false;const x=parseKey(k);return !Number.isNaN(x.getTime())&&localDateKey(x)===k}
+function validDiscipline(v){return v==='followed'||v==='broke'}
+function validSetup(v){return ['setup_1','setup_2','setup_3','setup_4'].includes(v)}
+function setupShort(v){return v==='setup_1'?'Setup 1':v==='setup_2'?'Setup 2':v==='setup_3'?'Setup 3':v==='setup_4'?'Setup 4':'—'}
+function setupLabel(v){return v==='setup_1'?'Setup 1 — 5M Break + Gap / Breaker Block':v==='setup_2'?'Setup 2 — 5M Inducement + Liquidity Sweep':v==='setup_3'?'Setup 3 — Consolidation Sweep + Structure Break':v==='setup_4'?'Setup 4 — Multi-Timeframe Alignment + Gap':'N/A'}
+function normalizeReview(r){
+  if(!r||!validDateKey(r.date))return null
+  const result=['win','loss','break_even','no_trade'].includes(r.result)?r.result:null
+  let risk=validDiscipline(r.risk)?r.risk:null,strategy=validDiscipline(r.strategy)?r.strategy:null
+  let setup=validSetup(r.setup)?r.setup:null
+  if(result==='no_trade'){risk=null;strategy=null;setup=null}
+  if(result!=='no_trade'&&(!risk||!strategy))return null
+  return {id:r.id||null,date:r.date,risk,strategy,setup,result,createdAt:r.created_at||r.createdAt||null,updatedAt:r.updated_at||r.updatedAt||null}
+}
+function normalizeReviews(list){const map=new Map();(Array.isArray(list)?list:[]).forEach(x=>{const r=normalizeReview(x);if(r)map.set(r.date,r)});return [...map.values()].sort((a,b)=>b.date.localeCompare(a.date))}
+function getReview(date){return state.reviews.find(r=>r.date===date)||null}
+
+async function rpc(name, args = {}) {
+  if (!configReady()) throw new Error('Supabase is not configured yet.')
+  let res
+  try {
+    res = await fetch(`${String(CONFIG.SUPABASE_URL).replace(/\/$/,'')}/rest/v1/rpc/${name}`, {
+      method: 'POST',
+      headers: {
+        'apikey': CONFIG.SUPABASE_PUBLISHABLE_KEY,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(args)
+    })
+  } catch {
+    throw new Error('Could not reach Supabase. Check your internet connection.')
+  }
+  const text = await res.text()
+  let data = null
+  if (text) { try { data = JSON.parse(text) } catch { data = text } }
+  if (!res.ok) {
+    const msg = data?.message || data?.hint || data?.details || 'TradeFlow request failed'
+    if (/invalid or expired session/i.test(msg)) lockApp('Session expired. Enter your access code again.')
+    throw new Error(msg)
+  }
+  resetInactivityTimer()
+  return data
+}
+
+async function api(action, payload = {}) {
+  const token = sessionToken()
+  if (!token) throw new Error('TradeFlow is locked.')
+
+  if (action === 'bootstrap') {
+    return await rpc('tradeflow_bootstrap', { p_token: token })
+  }
+  if (action === 'set_theme') {
+    return await rpc('tradeflow_set_theme', { p_token: token, p_theme: payload.theme })
+  }
+  if (action === 'upsert_review') {
+    const r = payload.review
+    return await rpc('tradeflow_upsert_review', {
+      p_token: token,
+      p_date: r.date,
+      p_risk: r.risk,
+      p_strategy: r.strategy,
+      p_setup: r.setup,
+      p_result: r.result
+    })
+  }
+  if (action === 'delete_review') {
+    return await rpc('tradeflow_delete_review', { p_token: token, p_date: payload.date })
+  }
+  if (action === 'import_backup' || action === 'migrate_local') {
+    const rows = (payload.reviews || []).map(r=>({date:r.date,risk:r.risk,strategy:r.strategy,setup:r.setup||null,result:r.result}))
+    return await rpc('tradeflow_import', {
+      p_token: token,
+      p_reviews: rows,
+      p_theme: ['dark','light'].includes(payload.theme) ? payload.theme : null
+    })
+  }
+  throw new Error('Unknown TradeFlow action')
+}
+
+function applyThemeLocal(theme){
+  if(!['dark','light'].includes(theme))return
+  document.documentElement.dataset.theme=theme
+  try{localStorage.setItem(THEME_CACHE_KEY,theme)}catch{}
+  renderThemeButtons()
+}
+async function applyTheme(theme, sync = true){
+  const previous = document.documentElement.dataset.theme || 'dark'
+  applyThemeLocal(theme)
+  if(!sync || !state.unlocked)return
+  try { setSync('Saving theme…','busy'); await api('set_theme',{theme}); state.settings.theme=theme; setSync('Synced','ok'); toast('Theme saved') }
+  catch(e){ applyThemeLocal(previous); setSync('Sync error','error'); toast(e.message || 'Could not save theme') }
+}
+
+function unlockUi(){
+  state.unlocked=true
+  $('#authScreen').classList.add('hidden')
+  $('.app').classList.remove('is-locked')
+  $('.mobile-nav').classList.remove('is-locked')
+  resetInactivityTimer()
+}
+function lockApp(message = ''){
+  state.unlocked=false
+  setSession('')
+  clearTimeout(state.inactivityTimer)
+  $('.app').classList.add('is-locked')
+  $('.mobile-nav').classList.add('is-locked')
+  $('#authScreen').classList.remove('hidden')
+  $('#accessCode').value=''
+  $('#authError').textContent=message
+  setSync('Locked')
+}
+function resetInactivityTimer(){
+  clearTimeout(state.inactivityTimer)
+  if(!state.unlocked)return
+  const minutes = Math.max(5, Number(CONFIG.AUTO_LOCK_MINUTES || 30))
+  state.inactivityTimer = setTimeout(()=>lockApp('TradeFlow locked after inactivity.'), minutes*60*1000)
+}
+;['click','keydown','touchstart'].forEach(evt=>document.addEventListener(evt,()=>{if(state.unlocked)resetInactivityTimer()},{passive:true}))
+
+async function unlockWithCode(code){
+  if(!/^\d{6}$/.test(code)){ $('#authError').textContent='Enter a 6-digit code.'; return }
+  $('#authError').textContent=''; $('#unlockBtn').disabled=true; $('#unlockBtn').textContent='Checking…'
+  try{
+    const result = await rpc('tradeflow_unlock', { p_code: code })
+    if(!result?.ok || !result?.token) throw new Error(result?.message || 'Incorrect code')
+    setSession(result.token)
+    unlockUi()
+    toast('Access granted')
+    await bootstrap()
+  }catch(e){
+    $('#authError').textContent=e.message || 'Incorrect code'
+  }finally{ $('#unlockBtn').disabled=false; $('#unlockBtn').textContent='Unlock TradeFlow' }
+}
+
+async function bootstrap(){
+  showLoading('Loading TradeFlow…'); setSync('Syncing…','busy')
+  try{
+    const data = await api('bootstrap')
+    state.reviews = normalizeReviews(data.reviews)
+    state.settings = {officialStartDate:data.settings?.official_start_date || '2026-10-22', theme:data.settings?.theme || 'dark'}
+    applyThemeLocal(state.settings.theme)
+    renderAll(); setSync('Synced','ok')
+  }catch(e){
+    setSync('Sync error','error'); toast(e.message || 'Could not load data')
+  }finally{hideLoading()}
+}
+
+function validateDraft(data){
+  if(!validDateKey(data.date))return {ok:false,msg:'Invalid date'}
+  if(!['win','loss','break_even','no_trade'].includes(data.result))return {ok:false,msg:'Choose a Result'}
+  if(data.result==='no_trade')return {ok:true,review:{date:data.date,risk:null,strategy:null,setup:null,result:'no_trade'}}
+  if(!validDiscipline(data.risk)||!validDiscipline(data.strategy))return {ok:false,msg:'Win/Loss/Break Even requires Risk and Strategy'}
+  if(!validSetup(data.setup))return {ok:false,msg:'Choose a Trading Setup'}
+  return {ok:true,review:{date:data.date,risk:data.risk,strategy:data.strategy,setup:data.setup,result:data.result}}
+}
+async function saveReview(data){
+  const v=validateDraft(data); if(!v.ok)throw new Error(v.msg)
+  setSync('Saving…','busy')
+  const response = await api('upsert_review',{review:v.review})
+  const r=normalizeReview(response.review)
+  const i=state.reviews.findIndex(x=>x.date===r.date)
+  if(i>=0)state.reviews[i]=r; else state.reviews.push(r)
+  state.reviews=normalizeReviews(state.reviews); setSync('Synced','ok')
+  return r
+}
+async function deleteReview(date){
+  setSync('Deleting…','busy'); await api('delete_review',{date}); state.reviews=state.reviews.filter(r=>r.date!==date); setSync('Synced','ok')
+}
+
+function overall(r){if(!r)return {key:'none',label:'No Review',color:'grey'};if(r.result==='no_trade')return {key:'na',label:'N/A',color:'grey'};if(!validDiscipline(r.risk)||!validDiscipline(r.strategy))return {key:'na',label:'N/A',color:'grey'};if(r.risk==='followed'&&r.strategy==='followed')return {key:'perfect',label:'Perfect Day',color:'green'};if(r.risk==='broke'&&r.strategy==='broke')return {key:'poor',label:'Poor Discipline',color:'red'};return {key:'mixed',label:'Mixed Day',color:'orange'}}
+function resultLabel(v){return v==='win'?'Win':v==='loss'?'Loss':v==='break_even'?'Break Even':v==='no_trade'?'No Trade':'Unrecorded'}
+function resultBadge(v){return `<span class="badge ${v||'unrecorded'}">${resultLabel(v)}</span>`}
+function rowClass(v){return v==='win'?'row-win':v==='loss'?'row-loss':v==='break_even'?'row-break_even':v==='no_trade'?'row-no_trade':''}
+function applicableDisciplineReviews(list){return list.filter(r=>r.result!=='no_trade'&&validDiscipline(r.risk)&&validDiscipline(r.strategy))}
+function reviewsForRange(range=state.range){if(range==='all')return [...state.reviews];const days=Number(range),start=addDays(new Date(),-(days-1));start.setHours(0,0,0,0);return state.reviews.filter(r=>parseKey(r.date)>=start)}
+function disciplinePct(field,reviews){const applicable=reviews.filter(r=>r.result!=='no_trade'&&validDiscipline(r[field]));if(!applicable.length)return null;return Math.round(applicable.filter(r=>r[field]==='followed').length/applicable.length*100)}
+function perfectCount(reviews){return reviews.filter(r=>overall(r).key==='perfect').length}
+function minMaxReviewDates(){if(!state.reviews.length)return null;const dates=state.reviews.map(r=>r.date).sort();return {min:dates[0],max:dates[dates.length-1]}}
+function currentDisciplineStreak(){const mm=minMaxReviewDates();if(!mm)return 0;let cursor=parseKey(mm.max),n=0;while(cursor>=parseKey(mm.min)){const r=getReview(localDateKey(cursor));if(!r)break;if(r.result==='no_trade'){cursor=addDays(cursor,-1);continue}if(overall(r).key!=='perfect')break;n++;cursor=addDays(cursor,-1)}return n}
+function disciplineStreaks(){const mm=minMaxReviewDates();if(!mm)return[];let d=parseKey(mm.min),end=parseKey(mm.max),cur=0,out=[];while(d<=end){const r=getReview(localDateKey(d));if(!r){if(cur){out.push(cur);cur=0}}else if(r.result==='no_trade'){}else if(overall(r).key==='perfect'){cur++}else{if(cur){out.push(cur);cur=0}}d=addDays(d,1)}if(cur)out.push(cur);return out}
+function bestDisciplineStreak(){const s=disciplineStreaks();return s.length?Math.max(...s):0}
+function previousDisciplineStreak(){const s=disciplineStreaks();const current=currentDisciplineStreak();if(!s.length)return null;if(current>0&&s[s.length-1]===current)return s.length>1?s[s.length-2]:null;return s[s.length-1]||null}
+function previousBestDisciplineStreak(){const s=disciplineStreaks().sort((a,b)=>b-a);return s.length>1?s[1]:null}
+function setupPerformanceStats(){const stats={setup_1:{trades:0,wins:0,losses:0},setup_2:{trades:0,wins:0,losses:0},setup_3:{trades:0,wins:0,losses:0},setup_4:{trades:0,wins:0,losses:0}};for(const r of state.reviews){if(!validSetup(r.setup))continue;if(r.result==='win'||r.result==='loss'||r.result==='break_even')stats[r.setup].trades++;if(r.result==='win')stats[r.setup].wins++;else if(r.result==='loss')stats[r.setup].losses++}for(const key of Object.keys(stats)){const s=stats[key],decided=s.wins+s.losses;s.winRate=decided?Math.round((s.wins/decided*100)*10)/10:null}return stats}
+function formatSetupWinRate(v){return v==null?'Win Rate —':`Win Rate ${Number.isInteger(v)?v:v.toFixed(1)}%`}
+function performance(){const trading=[...state.reviews].filter(r=>r.result==='win'||r.result==='loss').sort((a,b)=>b.date.localeCompare(a.date));const wins=trading.filter(r=>r.result==='win').length,losses=trading.length-wins,breakEvens=state.reviews.filter(r=>r.result==='break_even').length,winRate=trading.length?Math.round(wins/trading.length*100):0;let winStreak=0,lossStreak=0;if(trading[0]?.result==='win')for(const r of trading){if(r.result!=='win')break;winStreak++}if(trading[0]?.result==='loss')for(const r of trading){if(r.result!=='loss')break;lossStreak++}return {wins,losses,breakEvens,winRate,winStreak,lossStreak}}
+function last30Summary(){let perfect=0,mixed=0,poor=0,none=0;for(let i=0;i<30;i++){const r=getReview(localDateKey(addDays(new Date(),-i))),o=overall(r);if(o.key==='perfect')perfect++;else if(o.key==='mixed')mixed++;else if(o.key==='poor')poor++;else none++}return {perfect,mixed,poor,none}}
+function fmtDate(k,short=false){if(k===localDateKey())return 'Today';return new Intl.DateTimeFormat('en-GB',short?{day:'2-digit',month:'short'}:{weekday:'short',day:'2-digit',month:'short',year:'numeric'}).format(parseKey(k))}
+function fmtStartDate(k){return new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',year:'numeric'}).format(parseKey(k))}
+function dotStatus(v){if(v==='followed')return `<span class="status-cell"><i class="dot green"></i><span>Followed</span></span>`;if(v==='broke')return `<span class="status-cell"><i class="dot red"></i><span>Broke Rules</span></span>`;return `<span class="status-cell"><i class="dot grey"></i><span>N/A</span></span>`}
+function overallHtml(r){const o=overall(r);return `<span class="overall ${o.color}"><i class="dot ${o.color}"></i>${o.label}</span>`}
+function rangeLabel(){return state.range==='all'?'All Time':`${state.range} Days`}
+function windowReviews(startDaysAgo,endDaysAgo){const start=addDays(new Date(),-startDaysAgo),end=addDays(new Date(),-endDaysAgo);start.setHours(0,0,0,0);end.setHours(23,59,59,999);return state.reviews.filter(r=>{const d=parseKey(r.date);return d>=start&&d<=end})}
+function monthReviews(offset=0){const d=new Date(),y=d.getFullYear(),m=d.getMonth()+offset;const start=new Date(y,m,1),end=new Date(y,m+1,0);return state.reviews.filter(r=>{const x=parseKey(r.date);return x>=start&&x<=end})}
+function setTrend(id,text,type='neutral'){const el=$(id);if(!el)return;el.textContent=text;el.className=`trend ${type}`}
+function signed(n,suffix=''){return `${n>0?'+':''}${n}${suffix}`}
+function renderComparisonText(){
+ const cur=currentDisciplineStreak(),prev=previousDisciplineStreak();
+ if(prev==null)setTrend('#streakTrend',cur?'New streak':'No previous data','neutral');else{const d=cur-prev;setTrend('#streakTrend',`${signed(d,' days')} from last streak`,d>0?'positive':d<0?'negative':'neutral')}
+ const best=bestDisciplineStreak(),prevBest=previousBestDisciplineStreak();
+ if(prevBest==null)setTrend('#bestStreakTrend',best?'New best':'No previous data','neutral');else{const d=best-prevBest;setTrend('#bestStreakTrend',`${signed(d,' days')} from previous best`,d>0?'positive':d<0?'negative':'neutral')}
+ const c30=windowReviews(29,0),p30=windowReviews(59,30);
+ for(const [field,id] of [['risk','#riskTrend'],['strategy','#strategyTrend']]){const c=disciplinePct(field,c30),p=disciplinePct(field,p30);if(c==null||p==null)setTrend(id,'No previous data','neutral');else{const d=c-p;setTrend(id,`${signed(d,'%')} vs previous 30 days`,d>0?'positive':d<0?'negative':'neutral')}}
+ const cm=perfectCount(monthReviews(0)),pm=perfectCount(monthReviews(-1));if(!state.reviews.length||pm===0&&cm===0)setTrend('#perfectTrend','No previous data','neutral');else{const d=cm-pm;setTrend('#perfectTrend',`${signed(d)} from last month`,d>0?'positive':d<0?'negative':'neutral')}
+}
+function renderAll(){renderDashboard();renderHistory();renderReview();renderThemeButtons();renderSettings()}
+function renderDashboard(){
+ const filtered=reviewsForRange(),applicable=applicableDisciplineReviews(filtered),rp=disciplinePct('risk',filtered),sp=disciplinePct('strategy',filtered),cur=currentDisciplineStreak(),best=bestDisciplineStreak();
+ $('#streakValue').textContent=`${cur} day${cur===1?'':'s'}`;$('#bestStreakValue').textContent=`${best} day${best===1?'':'s'}`;$('#riskPct').textContent=rp==null?'—':`${rp}%`;$('#strategyPct').textContent=sp==null?'—':`${sp}%`;$('#perfectDays').textContent=perfectCount(filtered);$('#riskNote').textContent=`${rangeLabel()} · ${applicable.length} applicable`;$('#strategyNote').textContent=`${rangeLabel()} · ${applicable.length} applicable`;$('#perfectNote').textContent=rangeLabel();$$('[data-range]').forEach(b=>b.classList.toggle('active',b.dataset.range===state.range));
+ $('#officialStartValue').textContent=state.settings.officialStartDate?fmtStartDate(state.settings.officialStartDate):'Oct 22, 2026';$('#officialStartNote').textContent='Locked permanently';
+ const p=performance();$('#winsValue').textContent=p.wins;$('#lossesValue').textContent=p.losses;$('#breakEvensValue').textContent=p.breakEvens;$('#winRateValue').textContent=`${p.winRate}%`;$('#winStreakValue').textContent=p.winStreak;$('#lossStreakValue').textContent=p.lossStreak;const ss=setupPerformanceStats();for(const [n,key] of [[1,'setup_1'],[2,'setup_2'],[3,'setup_3'],[4,'setup_4']]){const x=ss[key];$(`#setup${n}Trades`).textContent=`${x.trades} trade${x.trades===1?'':'s'}`;$(`#setup${n}WinRate`).textContent=formatSetupWinRate(x.winRate)}renderComparisonText();
+ const today=new Date(),day=today.getDay(),monday=addDays(today,day===0?-6:1-day);$('#weekStrip').innerHTML=Array.from({length:7},(_,i)=>{const d=addDays(monday,i),o=overall(getReview(localDateKey(d)));return `<div class="day"><div class="day-name">${['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][i]}</div><div class="day-date">${new Intl.DateTimeFormat('en-GB',{day:'2-digit',month:'short'}).format(d)}</div><i class="dot ${o.color}" title="${o.label}"></i></div>`}).join('');
+ const s=last30Summary();$('#sPerfect').textContent=s.perfect;$('#sMixed').textContent=s.mixed;$('#sPoor').textContent=s.poor;$('#sNone').textContent=s.none;renderCalendar();const recent=[...state.reviews].slice(0,8);$('#dashboardHistory').innerHTML=recent.map(r=>`<tr class="${rowClass(r.result)}"><td>${fmtDate(r.date)}</td><td>${dotStatus(r.risk)}</td><td>${dotStatus(r.strategy)}</td><td>${resultBadge(r.result)}</td><td>${overallHtml(r)}</td></tr>`).join('');$('#dashboardEmpty').style.display=recent.length?'none':'block'
+}
+function renderCalendar(){const y=state.calendarMonth.getFullYear(),m=state.calendarMonth.getMonth();$('#calendarTitle').textContent=new Intl.DateTimeFormat('en-GB',{month:'long',year:'numeric'}).format(state.calendarMonth);const first=new Date(y,m,1),offset=(first.getDay()+6)%7,start=addDays(first,-offset);let html=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(x=>`<div class="cal-weekday">${x}</div>`).join('');for(let i=0;i<42;i++){const d=addDays(start,i),k=localDateKey(d),r=getReview(k),inMonth=d.getMonth()===m;let dots='';if(r){if(r.result==='no_trade')dots=`<i class="dot grey"></i><i class="dot grey"></i>`;else dots=`<i class="dot ${r.risk==='followed'?'green':r.risk==='broke'?'red':'grey'}"></i><i class="dot ${r.strategy==='followed'?'green':r.strategy==='broke'?'red':'grey'}"></i>`}html+=`<button class="cal-cell ${!inMonth?'muted ':''}${k===localDateKey()?'today ':''}${r?'clickable ':''}${r?.result?`result-${r.result}`:''}" data-cal-date="${k}"><span class="cal-daynum">${d.getDate()}</span><div><div class="cal-dots">${dots}</div>${r?`<div class="cal-result">${resultLabel(r.result)}</div>`:''}</div></button>`}$('#calendarGrid').innerHTML=html}
+function filteredHistory(){return state.reviews.filter(r=>(state.filters.result==='all'||(state.filters.result==='unrecorded'?!r.result:r.result===state.filters.result))&&(state.filters.discipline==='all'||overall(r).key===state.filters.discipline))}
+function renderHistory(){const list=filteredHistory();$('#historyBody').innerHTML=list.map(r=>`<tr class="${rowClass(r.result)}"><td>${fmtDate(r.date)}</td><td>${dotStatus(r.risk)}</td><td>${dotStatus(r.strategy)}</td><td>${setupShort(r.setup)}</td><td>${resultBadge(r.result)}</td><td>${overallHtml(r)}</td><td><div class="history-actions"><button class="icon-btn" data-action="view" data-date="${r.date}">View</button><button class="icon-btn" data-action="edit" data-date="${r.date}">Edit</button><button class="icon-btn delete" data-action="delete" data-date="${r.date}">Delete</button></div></td></tr>`).join('');$('#historyEmpty').style.display=list.length?'none':'block';$('#historyEmpty').textContent=state.reviews.length?'No records match this filter.':'No reviews found.'}
+function reviewComplete(d){if(d.result==='no_trade')return true;if(d.result==='win'||d.result==='loss'||d.result==='break_even')return validDiscipline(d.risk)&&validDiscipline(d.strategy)&&validSetup(d.setup);return false}
+function renderReview(){const saved=getReview(localDateKey());if(saved&&state.draft.risk===null&&state.draft.strategy===null&&state.draft.setup===null&&state.draft.result===null)state.draft={risk:saved.risk,strategy:saved.strategy,setup:saved.setup||null,result:saved.result};const isNoTrade=state.draft.result==='no_trade';if(isNoTrade){state.draft.risk=null;state.draft.strategy=null;state.draft.setup=null}$$('.choice[data-field]').forEach(b=>{b.classList.toggle('selected',state.draft[b.dataset.field]===b.dataset.value);if((b.dataset.field==='risk'||b.dataset.field==='strategy'||b.dataset.field==='setup'))b.disabled=isNoTrade});$$('.review-card').slice(0,3).forEach(c=>c.classList.toggle('na',isNoTrade));const complete=reviewComplete(state.draft);$('#saveReviewBtn').disabled=!complete;$('#saveReviewBtn').textContent=saved?'Update Today':'Save Today';$('#reviewSummary strong').textContent=saved?'Today already has a review':'Today’s review';$('#reviewSummary span').textContent=isNoTrade?'No Trade selected — Risk, Strategy, and Setup are N/A.':saved?'Change any selection and update today’s review.':'Choose Risk, Strategy, Trading Setup, and Result.';const o=isNoTrade?{label:'N/A · No Trade',color:'grey'}:complete?overall(state.draft):{label:'Not complete',color:'grey'};$('#reviewOverall').className=`overall ${o.color}`;$('#reviewOverall').innerHTML=`<i class="dot ${o.color}"></i>${o.label}`}
+function renderSettings(){}
+function renderThemeButtons(){const theme=document.documentElement.dataset.theme;$$('[data-theme-choice]').forEach(b=>b.classList.toggle('active',b.dataset.themeChoice===theme))}
+function navigate(page){state.page=page;$$('.page').forEach(p=>p.classList.toggle('active',p.id===page));$$('[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===page));const c={dashboard:['Dashboard','Track discipline and outcome without confusing the two.'],review:['Daily Review','Risk, Strategy, Trading Setup, then Result — completed in seconds.'],history:['History','Review, filter, edit, or remove previous days.'],training:['Trading System Training','Focused practice for your trading system and execution rules.'],settings:['Settings','Cloud sync, theme, and backup. Official Start Date is locked.']};$('#pageTitle').textContent=c[page][0];$('#pageSub').textContent=c[page][1];if(page==='review'){state.draft={risk:null,strategy:null,setup:null,result:null};renderReview()}window.scrollTo({top:0,behavior:'smooth'})}
+function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.classList.remove('show'),2300)}
+function closeModal(){$('#modalBackdrop').classList.remove('show');state.pendingImport=null}
+function showDay(date){const r=getReview(date);if(!r){$('#modal').innerHTML=`<h3>${fmtDate(date)}</h3><p>No review recorded for this day.</p><div class="modal-actions"><button class="secondary" id="modalClose">Close</button></div>`;$('#modalBackdrop').classList.add('show');$('#modalClose').onclick=closeModal;return}$('#modal').innerHTML=`<h3>${fmtDate(date)}</h3><p>Discipline, setup, and result are shown separately.</p><div class="kv"><span>Risk Management</span>${dotStatus(r.risk)}</div><div class="kv"><span>Strategy</span>${dotStatus(r.strategy)}</div><div class="kv"><span>Trading Setup</span><strong>${setupLabel(r.setup)}</strong></div><div class="kv"><span>Daily Result</span>${resultBadge(r.result)}</div><div class="kv"><span>Overall Discipline</span>${overallHtml(r)}</div><div class="modal-actions"><button class="secondary" id="modalClose">Close</button><button class="primary" id="modalEdit">Edit</button></div>`;$('#modalBackdrop').classList.add('show');$('#modalClose').onclick=closeModal;$('#modalEdit').onclick=()=>showEdit(date)}
+function showEdit(date){const r=getReview(date);if(!r)return;let draft={risk:r.risk,strategy:r.strategy,setup:r.setup||null,result:r.result};$('#modal').innerHTML=`<h3>Edit ${fmtDate(date)}</h3><p>Update this day without creating a duplicate.</p><div class="modal-grid"><div id="editRisk"><strong>Risk Management</strong><div class="choices"><button class="choice followed ${r.risk==='followed'?'selected':''}" data-mf="risk" data-v="followed">Followed</button><button class="choice broke ${r.risk==='broke'?'selected':''}" data-mf="risk" data-v="broke">Broke Rules</button></div></div><div id="editStrategy"><strong>Strategy</strong><div class="choices"><button class="choice followed ${r.strategy==='followed'?'selected':''}" data-mf="strategy" data-v="followed">Followed</button><button class="choice broke ${r.strategy==='broke'?'selected':''}" data-mf="strategy" data-v="broke">Broke Rules</button></div></div><div id="editSetup"><strong>Trading Setup</strong><div class="choices setup-choices"><button class="choice setup-choice ${r.setup==='setup_1'?'selected':''}" data-mf="setup" data-v="setup_1">Setup 1</button><button class="choice setup-choice ${r.setup==='setup_2'?'selected':''}" data-mf="setup" data-v="setup_2">Setup 2</button><button class="choice setup-choice ${r.setup==='setup_3'?'selected':''}" data-mf="setup" data-v="setup_3">Setup 3</button><button class="choice setup-choice ${r.setup==='setup_4'?'selected':''}" data-mf="setup" data-v="setup_4">Setup 4</button></div></div><div><strong>Result</strong><div class="choices four"><button class="choice win ${r.result==='win'?'selected':''}" data-mf="result" data-v="win">Win</button><button class="choice loss ${r.result==='loss'?'selected':''}" data-mf="result" data-v="loss">Loss</button><button class="choice break_even ${r.result==='break_even'?'selected':''}" data-mf="result" data-v="break_even">Break Even</button><button class="choice no_trade ${r.result==='no_trade'?'selected':''}" data-mf="result" data-v="no_trade">No Trade</button></div></div></div><div class="modal-actions"><button class="secondary" id="modalCancel">Cancel</button><button class="primary" id="modalSave">Save Changes</button></div>`;$('#modalBackdrop').classList.add('show');const refresh=()=>{const no=draft.result==='no_trade';if(no){draft.risk=null;draft.strategy=null;draft.setup=null}$$('[data-mf]',$('#modal')).forEach(b=>{b.classList.toggle('selected',draft[b.dataset.mf]===b.dataset.v);if(b.dataset.mf==='risk'||b.dataset.mf==='strategy'||b.dataset.mf==='setup')b.disabled=no});$('#editRisk').style.opacity=no?'.55':'1';$('#editStrategy').style.opacity=no?'.55':'1';$('#editSetup').style.opacity=no?'.55':'1'};refresh();$$('[data-mf]',$('#modal')).forEach(b=>b.onclick=()=>{draft[b.dataset.mf]=b.dataset.v;refresh()});$('#modalCancel').onclick=closeModal;$('#modalSave').onclick=async()=>{if(!draft.result){toast('Choose a Result');return}if(!reviewComplete(draft)){toast(validDiscipline(draft.risk)&&validDiscipline(draft.strategy)?'Choose a Trading Setup':'Win/Loss/Break Even requires Risk and Strategy');return}$('#modalSave').disabled=true;try{await saveReview({date,...draft});closeModal();renderAll();toast('Review updated')}catch(e){toast(e.message||'Could not update review');$('#modalSave').disabled=false}}}
+function confirmDelete(date){$('#modal').innerHTML=`<h3>Delete this daily review?</h3><p>${fmtDate(date)} will be removed from Dashboard and calculations. Your Start Date remains locked.</p><div class="modal-actions"><button class="secondary" id="deleteCancel">Cancel</button><button class="danger" id="deleteConfirm">Delete</button></div>`;$('#modalBackdrop').classList.add('show');$('#deleteCancel').onclick=closeModal;$('#deleteConfirm').onclick=async()=>{try{$('#deleteConfirm').disabled=true;await deleteReview(date);closeModal();renderAll();toast('Review deleted')}catch(e){toast(e.message||'Could not delete review');$('#deleteConfirm').disabled=false}}}
+function exportBackup(){const payload={schema:BACKUP_SCHEMA,schemaVersion:SCHEMA_VERSION,exportedAt:new Date().toISOString(),reviews:state.reviews,preferences:{theme:state.settings.theme,officialStartDate:state.settings.officialStartDate,schemaVersion:SCHEMA_VERSION}};const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`tradeflow-backup-${localDateKey()}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('Backup exported')}
+function validateBackup(data){if(!data||typeof data!=='object'||!Array.isArray(data.reviews))return null;const reviews=normalizeReviews(data.reviews);if(data.reviews.length&&reviews.length===0)return null;const theme=['dark','light'].includes(data.preferences?.theme)?data.preferences.theme:null;return {reviews,theme}}
+function askImport(candidate){state.pendingImport=candidate;$('#modal').innerHTML=`<h3>Import backup?</h3><p>This will merge <strong>${candidate.reviews.length}</strong> review${candidate.reviews.length===1?'':'s'} into Supabase by date. Matching dates will be updated; other cloud reviews remain.</p><p>The locked Start Date stays <strong>Oct 22, 2026</strong>.</p><div class="modal-actions"><button class="secondary" id="importCancel">Cancel</button><button class="primary" id="importConfirm">Import Backup</button></div>`;$('#modalBackdrop').classList.add('show');$('#importCancel').onclick=closeModal;$('#importConfirm').onclick=async()=>{const c=state.pendingImport;try{$('#importConfirm').disabled=true;showLoading('Importing backup…');await api('import_backup',{reviews:c.reviews,theme:c.theme});closeModal();await bootstrap();navigate('dashboard');toast('Backup imported')}catch(e){toast(e.message||'Could not import backup')}finally{hideLoading()}}}
+function handleImport(file){if(!file)return;const reader=new FileReader();reader.onload=()=>{try{const c=validateBackup(JSON.parse(reader.result));if(!c){toast('Invalid backup file');return}askImport(c)}catch{toast('Invalid backup file')}};reader.onerror=()=>toast('Could not read backup file');reader.readAsText(file)}
+function legacyLocalData(){try{const raw=JSON.parse(localStorage.getItem(LEGACY_REVIEWS_KEY)||'[]');const reviews=normalizeReviews(raw);const theme=localStorage.getItem(LEGACY_THEME_KEY);const prefs=JSON.parse(localStorage.getItem(LEGACY_PREFS_KEY)||'{}');return {reviews,theme:['dark','light'].includes(theme)?theme:null,officialStartDate:prefs.officialStartDate||prefs.startDate||null}}catch{return {reviews:[],theme:null,officialStartDate:null}}}
+function confirmMigration(){const legacy=legacyLocalData();if(!legacy.reviews.length){toast('No legacy local data found');return}$('#modal').innerHTML=`<h3>Migrate local data?</h3><p>Found <strong>${legacy.reviews.length}</strong> older local review${legacy.reviews.length===1?'':'s'}. Supabase will merge by date, so 22 Oct 2026 will not duplicate.</p><div class="modal-actions"><button class="secondary" id="migCancel">Cancel</button><button class="primary" id="migConfirm">Migrate</button></div>`;$('#modalBackdrop').classList.add('show');$('#migCancel').onclick=closeModal;$('#migConfirm').onclick=async()=>{try{$('#migConfirm').disabled=true;showLoading('Migrating local data…');await api('migrate_local',{reviews:legacy.reviews,theme:legacy.theme});closeModal();await bootstrap();toast('Local data migrated')}catch(e){toast(e.message||'Could not migrate data')}finally{hideLoading()}}}
+
+// Events
+$('#unlockForm').addEventListener('submit',e=>{e.preventDefault();unlockWithCode($('#accessCode').value.trim())})
+$('#toggleCode').onclick=()=>{const input=$('#accessCode');input.type=input.type==='password'?'text':'password';$('#toggleCode').textContent=input.type==='password'?'Show':'Hide'}
+$('#accessCode').addEventListener('input',e=>{e.target.value=e.target.value.replace(/\D/g,'').slice(0,6)})
+$('#lockBtn').onclick=()=>{lockApp();toast('Session locked')}
+$$('[data-page]').forEach(b=>b.addEventListener('click',()=>navigate(b.dataset.page)))
+$('#goReviewBtn').onclick=()=>navigate('review')
+$$('.choice[data-field]').forEach(b=>b.addEventListener('click',()=>{state.draft[b.dataset.field]=b.dataset.value;if(b.dataset.field==='result'&&b.dataset.value==='no_trade'){state.draft.risk=null;state.draft.strategy=null;state.draft.setup=null}renderReview()}))
+$('#clearReviewBtn').onclick=()=>{state.draft={risk:null,strategy:null,setup:null,result:null};renderReview()}
+$('#saveReviewBtn').onclick=async()=>{if(!state.draft.result){toast('Choose a Result');return}if(!reviewComplete(state.draft)){toast(validDiscipline(state.draft.risk)&&validDiscipline(state.draft.strategy)?'Choose a Trading Setup':'Win/Loss/Break Even requires Risk and Strategy');return}const existed=!!getReview(localDateKey());$('#saveReviewBtn').disabled=true;showLoading(existed?'Updating review…':'Saving review…');try{await saveReview({date:localDateKey(),...state.draft});renderAll();toast(existed?'Review updated':'Review saved');navigate('dashboard')}catch(e){toast(e.message||'Could not save review')}finally{hideLoading();renderReview()}}
+$('#historyBody').addEventListener('click',e=>{const b=e.target.closest('[data-action]');if(!b)return;if(b.dataset.action==='view')showDay(b.dataset.date);if(b.dataset.action==='edit')showEdit(b.dataset.date);if(b.dataset.action==='delete')confirmDelete(b.dataset.date)})
+$('#calendarGrid').addEventListener('click',e=>{const cell=e.target.closest('[data-cal-date]');if(cell)showDay(cell.dataset.calDate)})
+$('#modalBackdrop').addEventListener('click',e=>{if(e.target===$('#modalBackdrop'))closeModal()})
+$$('[data-theme-choice]').forEach(b=>b.onclick=()=>applyTheme(b.dataset.themeChoice,true))
+$$('[data-range]').forEach(b=>b.onclick=()=>{state.range=b.dataset.range;renderDashboard()})
+$('#prevMonth').onclick=()=>{state.calendarMonth=new Date(state.calendarMonth.getFullYear(),state.calendarMonth.getMonth()-1,1);renderCalendar()}
+$('#nextMonth').onclick=()=>{state.calendarMonth=new Date(state.calendarMonth.getFullYear(),state.calendarMonth.getMonth()+1,1);renderCalendar()}
+$('#resultFilter').onchange=e=>{state.filters.result=e.target.value;renderHistory()}
+$('#disciplineFilter').onchange=e=>{state.filters.discipline=e.target.value;renderHistory()}
+$('#exportBackupBtn').onclick=exportBackup
+$('#importBackupBtn').onclick=()=>$('#importFile').click()
+$('#importFile').onchange=e=>{handleImport(e.target.files?.[0]);e.target.value=''}
+$('#migrateLocalBtn').onclick=confirmMigration
+
+// Initial visual state
+const cachedTheme=(()=>{try{return localStorage.getItem(THEME_CACHE_KEY)||localStorage.getItem(LEGACY_THEME_KEY)||'dark'}catch{return'dark'}})()
+applyThemeLocal(['dark','light'].includes(cachedTheme)?cachedTheme:'dark')
+$('#todayLabel').textContent=new Intl.DateTimeFormat('en-GB',{weekday:'long',day:'2-digit',month:'long',year:'numeric'}).format(new Date())
+$('.app').classList.add('is-locked'); $('.mobile-nav').classList.add('is-locked')
+if(!configReady()) $('#authError').textContent='TradeFlow configuration is incomplete.'
+else if(sessionToken()) { unlockUi(); bootstrap() }
+
+window.TradeFlowTest={state,overall,performance,currentDisciplineStreak,bestDisciplineStreak,disciplinePct,renderAll,normalizeReviews}
+})()
